@@ -20,7 +20,204 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# PATHS & CACHED ASSETS
+# TMDB API CONFIGURATION & CLIENT HELPERS
+# ==============================================================================
+# Safely check for user-provided API key in secrets, otherwise use default working key
+try:
+    TMDB_API_KEY = st.secrets.get("TMDB_API_KEY", "8265bd1679663a7ea12ac168da84d2e8")
+except Exception:
+    TMDB_API_KEY = "8265bd1679663a7ea12ac168da84d2e8"
+
+TMDB_BASE_URL = "https://api.themoviedb.org/3"
+TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
+
+GENRE_MAP = {
+    "Action": 28, "Adventure": 12, "Animation": 16, "Comedy": 35,
+    "Crime": 80, "Documentary": 99, "Drama": 18, "Family": 10751,
+    "Fantasy": 14, "History": 36, "Horror": 27, "Music": 10402,
+    "Mystery": 9648, "Romance": 10749, "Sci-Fi": 878, "Thriller": 53,
+    "War": 10752, "Western": 37
+}
+ID_TO_GENRE = {v: k for k, v in GENRE_MAP.items()}
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_tmdb_json(endpoint, params=None):
+    """Fetch JSON from TMDB API with error handling and caching."""
+    if params is None:
+        params = {}
+    params["api_key"] = TMDB_API_KEY
+    url = f"{TMDB_BASE_URL}/{endpoint}?{urllib.parse.urlencode(params)}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "MovieRecApp/2.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return {}
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def search_movies_tmdb(query, max_results=20):
+    """Search TMDB's 800,000+ movie catalog by title."""
+    if not query:
+        return []
+    data = fetch_tmdb_json("search/movie", {"query": query, "include_adult": "false"})
+    results = data.get("results", [])
+    movies = []
+    for m in results[:max_results]:
+        genre_names = [ID_TO_GENRE.get(gid, "") for gid in m.get("genre_ids", []) if gid in ID_TO_GENRE]
+        genre_str = " • ".join(genre_names[:2]) if genre_names else "Cinema"
+        poster_path = m.get("poster_path")
+        poster_url = f"{TMDB_IMAGE_BASE}{poster_path}" if poster_path else "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=500&auto=format&fit=crop&q=80"
+        movies.append({
+            "id": m.get("id"),
+            "title": m.get("title", "Untitled"),
+            "genre": genre_str,
+            "rating": str(round(m.get("vote_average", 0.0), 1)),
+            "raw_rating": m.get("vote_average", 0.0),
+            "genre_ids": m.get("genre_ids", []),
+            "poster_url": poster_url,
+            "release_date": m.get("release_date", "N/A"),
+            "overview": m.get("overview", "")
+        })
+    return movies
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_tmdb_deep_similar(movie_id, mode="recommendations", max_items=24, min_rating=0.0, filter_genre="All Genres"):
+    """Fetch deep similarity catalog across multiple pages from TMDB."""
+    all_movies = []
+    seen_ids = {movie_id}
+    # Calculate how many TMDB pages needed (each page has up to 20 results)
+    pages_to_fetch = min(4, (max_items // 15) + 1)
+    
+    for page in range(1, pages_to_fetch + 1):
+        data = fetch_tmdb_json(f"movie/{movie_id}/{mode}", {"page": page})
+        results = data.get("results", [])
+        
+        # If recommendations is sparse, fallback to similar endpoint
+        if not results and mode == "recommendations":
+            data = fetch_tmdb_json(f"movie/{movie_id}/similar", {"page": page})
+            results = data.get("results", [])
+            
+        if not results:
+            break
+            
+        for m in results:
+            mid = m.get("id")
+            if mid in seen_ids or not m.get("poster_path"):
+                continue
+            seen_ids.add(mid)
+            
+            vote_avg = m.get("vote_average", 0.0)
+            if vote_avg < min_rating:
+                continue
+                
+            genre_names = [ID_TO_GENRE.get(gid, "") for gid in m.get("genre_ids", []) if gid in ID_TO_GENRE]
+            if filter_genre != "All Genres" and filter_genre not in genre_names:
+                continue
+                
+            genre_str = " • ".join(genre_names[:2]) if genre_names else "Cinema"
+            poster_url = f"{TMDB_IMAGE_BASE}{m.get('poster_path')}"
+            
+            all_movies.append({
+                "id": mid,
+                "title": m.get("title", "Untitled"),
+                "genre": genre_str,
+                "rating": str(round(vote_avg, 1)),
+                "raw_rating": vote_avg,
+                "poster_url": poster_url,
+                "release_date": m.get("release_date", "N/A"),
+                "overview": m.get("overview", "")
+            })
+            if len(all_movies) >= max_items:
+                break
+        if len(all_movies) >= max_items:
+            break
+            
+    return all_movies
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def get_multi_movie_recommendations(movie_ids, top_n=24):
+    """Aggregate recommendations from multiple favorite films across TMDB."""
+    score_map = {}
+    details_map = {}
+    
+    for mid in movie_ids:
+        recs = get_tmdb_deep_similar(mid, mode="recommendations", max_items=20)
+        for rank, m in enumerate(recs):
+            rec_id = m["id"]
+            # Weight higher ranks and multiple co-occurrences
+            weight = (20 - rank) + (m.get("raw_rating", 0.0) * 1.5)
+            score_map[rec_id] = score_map.get(rec_id, 0.0) + weight
+            details_map[rec_id] = m
+            
+    # Sort by aggregate score
+    sorted_ids = sorted(score_map, key=score_map.get, reverse=True)[:top_n]
+    return [details_map[i] for i in sorted_ids if i not in movie_ids]
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def discover_movies_tmdb(genre_name="All Genres", year_category="All Years", min_rating_str="Any", max_results=12):
+    """Query TMDB live database using multi-criteria filters."""
+    params = {
+        "sort_by": "popularity.desc",
+        "include_adult": "false",
+        "vote_count.gte": 100
+    }
+    if genre_name != "All Genres" and genre_name in GENRE_MAP:
+        params["with_genres"] = GENRE_MAP[genre_name]
+        
+    if year_category == "2020s":
+        params["primary_release_date.gte"] = "2020-01-01"
+    elif year_category == "2010s":
+        params["primary_release_date.gte"] = "2010-01-01"
+        params["primary_release_date.lte"] = "2019-12-31"
+    elif year_category == "2000s":
+        params["primary_release_date.gte"] = "2000-01-01"
+        params["primary_release_date.lte"] = "2009-12-31"
+    elif year_category == "1990s":
+        params["primary_release_date.gte"] = "1990-01-01"
+        params["primary_release_date.lte"] = "1999-12-31"
+    elif year_category == "1980s & Earlier":
+        params["primary_release_date.lte"] = "1989-12-31"
+        
+    if min_rating_str != "Any":
+        try:
+            params["vote_average.gte"] = float(min_rating_str.split("+")[0])
+        except Exception:
+            pass
+            
+    data = fetch_tmdb_json("discover/movie", params)
+    results = data.get("results", [])
+    movies = []
+    for m in results[:max_results]:
+        genre_names = [ID_TO_GENRE.get(gid, "") for gid in m.get("genre_ids", []) if gid in ID_TO_GENRE]
+        genre_str = " • ".join(genre_names[:2]) if genre_names else "Cinema"
+        poster_path = m.get("poster_path")
+        poster_url = f"{TMDB_IMAGE_BASE}{poster_path}" if poster_path else "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=500&auto=format&fit=crop&q=80"
+        movies.append({
+            "id": m.get("id"),
+            "title": m.get("title", "Untitled"),
+            "genre": genre_str,
+            "rating": str(round(m.get("vote_average", 0.0), 1)),
+            "poster_url": poster_url,
+            "release_date": m.get("release_date", "N/A"),
+            "overview": m.get("overview", "")
+        })
+    return movies
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def get_movie_trailer_key(movie_id):
+    """Retrieve YouTube trailer embed key for a TMDB film."""
+    data = fetch_tmdb_json(f"movie/{movie_id}/videos")
+    results = data.get("results", [])
+    trailers = [v for v in results if v.get("type") == "Trailer" and v.get("site") == "YouTube"]
+    if trailers:
+        return trailers[0].get("key")
+    videos = [v for v in results if v.get("site") == "YouTube"]
+    if videos:
+        return videos[0].get("key")
+    return None
+
+# ==============================================================================
+# LOCAL CACHED ASSETS & ML MODEL LOADERS
 # ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "movie_recommender")
@@ -40,187 +237,77 @@ def get_image_base64(filepath):
 
 @st.cache_resource
 def load_models_and_data():
-    """Load collaborative filtering models, matrices, and metadata."""
-    movie_info = pd.read_csv(os.path.join(MODEL_DIR, "movie_info.csv"))
-    
-    # Parse release year and clean title
-    def parse_title(t):
-        m = re.search(r'\((\d{4})\)', t)
-        year = int(m.group(1)) if m else None
-        clean = re.sub(r'\s*\(\d{4}\)', '', t).strip()
-        if clean.endswith(', The'):
-            clean = 'The ' + clean[:-5]
-        elif clean.endswith(', A'):
-            clean = 'A ' + clean[:-3]
-        return pd.Series([clean, year])
+    """Load local MovieLens collaborative filtering models and statistics."""
+    try:
+        movie_info = pd.read_csv(os.path.join(MODEL_DIR, "movie_info.csv"))
+        
+        def parse_title(t):
+            m = re.search(r'\((\d{4})\)', t)
+            year = int(m.group(1)) if m else None
+            clean = re.sub(r'\s*\(\d{4}\)', '', t).strip()
+            if clean.endswith(', The'):
+                clean = 'The ' + clean[:-5]
+            elif clean.endswith(', A'):
+                clean = 'A ' + clean[:-3]
+            return pd.Series([clean, year])
 
-    parsed = movie_info['title'].apply(parse_title)
-    movie_info['clean_title'] = parsed[0]
-    movie_info['year'] = parsed[1]
-    
-    item_similarity = joblib.load(os.path.join(MODEL_DIR, "item_similarity.pkl"))
-    train_matrix = joblib.load(os.path.join(MODEL_DIR, "train_matrix.pkl"))
-    global_mean = float(joblib.load(os.path.join(MODEL_DIR, "global_mean.pkl")))
-    
-    # Compute ratings statistics
-    ratings_count = (train_matrix > 0).sum(axis=0)
-    ratings_sum = train_matrix.sum(axis=0)
-    ratings_mean = (ratings_sum / ratings_count.replace(0, 1)).round(1)
-    
-    stats_df = pd.DataFrame({
-        'movie_id': train_matrix.columns,
-        'rating_count': ratings_count.values,
-        'avg_rating': ratings_mean.values
-    })
-    
-    movie_info = pd.merge(movie_info, stats_df, on='movie_id', how='left')
-    movie_info['avg_rating'] = movie_info['avg_rating'].fillna(round(global_mean, 1))
-    movie_info['rating_count'] = movie_info['rating_count'].fillna(0).astype(int)
-    
-    return movie_info, item_similarity, train_matrix, global_mean
+        parsed = movie_info['title'].apply(parse_title)
+        movie_info['clean_title'] = parsed[0]
+        movie_info['year'] = parsed[1]
+        
+        item_similarity = joblib.load(os.path.join(MODEL_DIR, "item_similarity.pkl"))
+        train_matrix = joblib.load(os.path.join(MODEL_DIR, "train_matrix.pkl"))
+        global_mean = float(joblib.load(os.path.join(MODEL_DIR, "global_mean.pkl")))
+        
+        ratings_count = (train_matrix > 0).sum(axis=0)
+        ratings_sum = train_matrix.sum(axis=0)
+        ratings_mean = (ratings_sum / ratings_count.replace(0, 1)).round(1)
+        
+        stats_df = pd.DataFrame({
+            'movie_id': train_matrix.columns,
+            'rating_count': ratings_count.values,
+            'avg_rating': ratings_mean.values
+        })
+        
+        movie_info = pd.merge(movie_info, stats_df, on='movie_id', how='left')
+        movie_info['avg_rating'] = movie_info['avg_rating'].fillna(round(global_mean, 1))
+        movie_info['rating_count'] = movie_info['rating_count'].fillna(0).astype(int)
+        
+        return movie_info, item_similarity, train_matrix, global_mean
+    except Exception as e:
+        return pd.DataFrame(), None, None, 3.5
 
 movie_info, item_similarity, train_matrix, global_mean = load_models_and_data()
 
-# Movie poster lookup helper
-TMDB_API_KEY = "8265bd1679663a7ea12ac168da84d2e8"
-
-@st.cache_data(show_spinner=False, ttl=86400)
-def fetch_movie_poster_tmdb(query_title):
-    """Fetch poster URL and details from TMDB with fallback."""
-    try:
-        clean = query_title.split('(')[0].strip()
-        url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={urllib.parse.quote(clean)}"
-        req = urllib.request.Request(url, headers={"User-Agent": "MovieRec/1.0"})
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read().decode())
-            if data.get('results'):
-                res = data['results'][0]
-                poster_path = res.get('poster_path')
-                vote_avg = res.get('vote_average', 0.0)
-                overview = res.get('overview', '')
-                if poster_path:
-                    return {
-                        'poster': f"https://image.tmdb.org/t/p/w500{poster_path}",
-                        'rating': round(vote_avg, 1),
-                        'overview': overview
-                    }
-    except Exception:
-        pass
-    return None
-
 # ==============================================================================
-# CURATED SHOWCASE MOVIES (EXACT MATCH TO USER SCREENSHOT)
+# CURATED SHOWCASE MOVIES (MATCHING DESIGN SCREENSHOT)
 # ==============================================================================
-TRENDING_MOVIES = [
-    {
-        "id": "interstellar",
-        "title": "Interstellar",
-        "genre": "Sci-Fi • Drama",
-        "rating": "8.6",
-        "poster_file": "interstellar.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/yQvGrMoipbRoddT0ZR8tPoR7NfX.jpg"
-    },
-    {
-        "id": "inception",
-        "title": "Inception",
-        "genre": "Action • Sci-Fi",
-        "rating": "8.4",
-        "poster_file": "inception.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/xlaY2zyzMfkhk0HSC5VUwzoZPU1.jpg"
-    },
-    {
-        "id": "dark_knight",
-        "title": "The Dark Knight",
-        "genre": "Action • Crime",
-        "rating": "9.0",
-        "poster_file": "dark_knight.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/qJ2tW6WMUDux911r6m7haRef0WH.jpg"
-    },
-    {
-        "id": "endgame",
-        "title": "Avengers: Endgame",
-        "genre": "Action • Adventure",
-        "rating": "8.4",
-        "poster_file": "endgame.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/bR8ISy1O9XQxqiy0fQFw2BX72RQ.jpg"
-    },
-    {
-        "id": "spiderman",
-        "title": "Spider-Man: No Way Home",
-        "genre": "Action • Adventure",
-        "rating": "8.2",
-        "poster_file": "spiderman.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg"
-    },
-    {
-        "id": "shawshank",
-        "title": "The Shawshank Redemption",
-        "genre": "Drama",
-        "rating": "9.3",
-        "poster_file": "shawshank.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/9cqNxx0GxF0bflZmeSMuL5tnGzr.jpg"
-    }
+TRENDING_MOVIES_DEFAULT = [
+    {"id": 157336, "title": "Interstellar", "genre": "Sci-Fi • Drama", "rating": "8.6", "poster_file": "interstellar.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/yQvGrMoipbRoddT0ZR8tPoR7NfX.jpg"},
+    {"id": 27205, "title": "Inception", "genre": "Action • Sci-Fi", "rating": "8.4", "poster_file": "inception.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/xlaY2zyzMfkhk0HSC5VUwzoZPU1.jpg"},
+    {"id": 155, "title": "The Dark Knight", "genre": "Action • Crime", "rating": "9.0", "poster_file": "dark_knight.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/qJ2tW6WMUDux911r6m7haRef0WH.jpg"},
+    {"id": 299534, "title": "Avengers: Endgame", "genre": "Action • Adventure", "rating": "8.4", "poster_file": "endgame.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/bR8ISy1O9XQxqiy0fQFw2BX72RQ.jpg"},
+    {"id": 634649, "title": "Spider-Man: No Way Home", "genre": "Action • Adventure", "rating": "8.2", "poster_file": "spiderman.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/1g0dhYtq4irTY1GPXvft6k4YLjm.jpg"},
+    {"id": 278, "title": "The Shawshank Redemption", "genre": "Drama", "rating": "9.3", "poster_file": "shawshank.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/9cqNxx0GxF0bflZmeSMuL5tnGzr.jpg"}
 ]
 
-RECOMMENDED_MOVIES = [
-    {
-        "id": "martian",
-        "title": "The Martian",
-        "genre": "Adventure • Drama",
-        "rating": "8.0",
-        "poster_file": "martian.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/5BHuvQ6p9kfc091Z8RiFNhCwL4b.jpg"
-    },
-    {
-        "id": "dune",
-        "title": "Dune",
-        "genre": "Sci-Fi • Adventure",
-        "rating": "8.0",
-        "poster_file": "dune.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/v1tRXZ4JtD2Iv6fjkPvT4GiwslV.jpg"
-    },
-    {
-        "id": "bladerunner",
-        "title": "Blade Runner 2049",
-        "genre": "Sci-Fi • Drama",
-        "rating": "8.0",
-        "poster_file": "bladerunner.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/gajva2L0rPYkEWjzgFlBXCAVBE5.jpg"
-    },
-    {
-        "id": "tenet",
-        "title": "Tenet",
-        "genre": "Action • Sci-Fi",
-        "rating": "7.3",
-        "poster_file": "tenet.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/rrKH3VhHssGTCfPuaEQkxvEoElv.jpg"
-    },
-    {
-        "id": "oppenheimer",
-        "title": "Oppenheimer",
-        "genre": "Biography • Drama",
-        "rating": "8.3",
-        "poster_file": "oppenheimer.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/8Gxv8gSFCU0XGDykEGv7zR1n2ua.jpg"
-    },
-    {
-        "id": "prestige",
-        "title": "The Prestige",
-        "genre": "Drama • Mystery",
-        "rating": "8.5",
-        "poster_file": "prestige.jpg",
-        "fallback_url": "https://image.tmdb.org/t/p/w500/Ag2B2KHKQPukjH7WutmgnnSNurZ.jpg"
-    }
+RECOMMENDED_MOVIES_DEFAULT = [
+    {"id": 286217, "title": "The Martian", "genre": "Adventure • Drama", "rating": "8.0", "poster_file": "martian.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/5BHuvQ6p9kfc091Z8RiFNhCwL4b.jpg"},
+    {"id": 438631, "title": "Dune", "genre": "Sci-Fi • Adventure", "rating": "8.0", "poster_file": "dune.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/v1tRXZ4JtD2Iv6fjkPvT4GiwslV.jpg"},
+    {"id": 335984, "title": "Blade Runner 2049", "genre": "Sci-Fi • Drama", "rating": "8.0", "poster_file": "bladerunner.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/gajva2L0rPYkEWjzgFlBXCAVBE5.jpg"},
+    {"id": 577922, "title": "Tenet", "genre": "Action • Sci-Fi", "rating": "7.3", "poster_file": "tenet.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/rrKH3VhHssGTCfPuaEQkxvEoElv.jpg"},
+    {"id": 872585, "title": "Oppenheimer", "genre": "Biography • Drama", "rating": "8.3", "poster_file": "oppenheimer.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/8Gxv8gSFCU0XGDykEGv7zR1n2ua.jpg"},
+    {"id": 1124, "title": "The Prestige", "genre": "Drama • Mystery", "rating": "8.5", "poster_file": "prestige.jpg", "fallback_url": "https://image.tmdb.org/t/p/w500/Ag2B2KHKQPukjH7WutmgnnSNurZ.jpg"}
 ]
 
-def get_poster_src(movie_dict):
-    fname = movie_dict.get("poster_file")
+def get_poster_src(m_dict):
+    fname = m_dict.get("poster_file")
     if fname:
         p_path = os.path.join(POSTERS_DIR, fname)
         b64 = get_image_base64(p_path)
         if b64:
             return f"data:image/jpeg;base64,{b64}"
-    return movie_dict.get("fallback_url", "")
+    return m_dict.get("poster_url") or m_dict.get("fallback_url", "")
 
 # Load hero image
 hero_opt_path = os.path.join(ASSETS_DIR, "hero_cinema_opt.jpg")
@@ -228,13 +315,12 @@ hero_b64 = get_image_base64(hero_opt_path)
 hero_img_src = f"data:image/jpeg;base64,{hero_b64}" if hero_b64 else "https://images.unsplash.com/photo-1517604931442-7e0c8ed2963c?w=1000&auto=format&fit=crop&q=80"
 
 # ==============================================================================
-# CSS STYLING INJECTION
+# CSS STYLING INJECTION (EXACT TO DESIGN)
 # ==============================================================================
 st.html("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap');
 
-/* Global Font & App Canvas */
 html, body, [class*="css"] {
     font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, sans-serif !important;
     color: #e2e8f0;
@@ -245,14 +331,12 @@ html, body, [class*="css"] {
     background-attachment: fixed !important;
 }
 
-/* Streamlit Header */
 header[data-testid="stHeader"] {
     background: rgba(11, 14, 23, 0.7) !important;
     backdrop-filter: blur(12px) !important;
     border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
 }
 
-/* Main Container */
 .main .block-container {
     padding-top: 1.5rem !important;
     padding-bottom: 3.5rem !important;
@@ -261,9 +345,7 @@ header[data-testid="stHeader"] {
     max-width: 1460px !important;
 }
 
-/* =====================================================
-   SIDEBAR STYLING
-   ===================================================== */
+/* Sidebar Styling */
 section[data-testid="stSidebar"] {
     background: #090c14 !important;
     border-right: 1px solid rgba(255, 255, 255, 0.06) !important;
@@ -276,7 +358,6 @@ section[data-testid="stSidebar"] > div {
     padding-right: 1rem;
 }
 
-/* Brand Header */
 .brand-container {
     display: flex;
     align-items: center;
@@ -313,7 +394,7 @@ section[data-testid="stSidebar"] > div {
     letter-spacing: 0.3px;
 }
 
-/* Navigation Radio Styling */
+/* Sidebar Radio Navigation */
 div[data-testid="stRadio"] {
     margin-bottom: 20px;
     width: 100% !important;
@@ -365,7 +446,6 @@ div[data-testid="stRadio"] div[role="radiogroup"] > label:hover {
     color: #f1f5f9 !important;
 }
 
-/* Active navigation item with exact glowing pink/red gradient */
 div[data-testid="stRadio"] div[role="radiogroup"] > label:has(input:checked) {
     background: linear-gradient(90deg, #e52d53 0%, #aa1e4e 100%) !important;
     color: #ffffff !important;
@@ -396,7 +476,6 @@ section[data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] {
     border-radius: 8px !important;
 }
 
-/* Filter Submit Button */
 .filter-btn-container button {
     background: linear-gradient(90deg, #e52d53 0%, #d4274c 100%) !important;
     color: white !important;
@@ -416,9 +495,7 @@ section[data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] {
     box-shadow: 0 6px 20px rgba(229, 45, 83, 0.5) !important;
 }
 
-/* =====================================================
-   HERO BANNER
-   ===================================================== */
+/* Hero Section */
 .hero-card {
     background: linear-gradient(135deg, rgba(16, 21, 37, 0.95) 0%, rgba(20, 27, 49, 0.92) 50%, rgba(13, 17, 30, 0.98) 100%);
     border: 1px solid rgba(255, 255, 255, 0.08);
@@ -540,9 +617,7 @@ section[data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] {
     box-shadow: 0 12px 30px rgba(0, 0, 0, 0.6);
 }
 
-/* =====================================================
-   SECTION HEADERS
-   ===================================================== */
+/* Section Header */
 .section-header {
     display: flex;
     align-items: flex-end;
@@ -585,9 +660,7 @@ section[data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] {
     color: #ff4071;
 }
 
-/* =====================================================
-   MOVIE CARDS 6-COLUMN GRID
-   ===================================================== */
+/* Movie Cards Grid */
 .movie-grid {
     display: grid;
     grid-template-columns: repeat(6, 1fr);
@@ -689,7 +762,6 @@ section[data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] {
     color: #f1f5f9;
 }
 
-/* Analytics Metrics */
 .metric-box {
     background: #111625;
     border: 1px solid rgba(255, 255, 255, 0.08);
@@ -715,7 +787,7 @@ section[data-testid="stSidebar"] .stSelectbox div[data-baseweb="select"] {
 """)
 
 # ==============================================================================
-# SIDEBAR
+# SIDEBAR NAVIGATION & FILTER CONTROLS
 # ==============================================================================
 with st.sidebar:
     st.html("""
@@ -737,22 +809,25 @@ with st.sidebar:
         "ℹ️ About"
     ]
     
+    # Allow programmatic tab switching via session state
+    if "selected_nav" not in st.session_state:
+        st.session_state.selected_nav = nav_options[0]
+        
     selected_page = st.radio(
         "Navigation",
         options=nav_options,
-        index=0,
-        label_visibility="collapsed"
+        index=nav_options.index(st.session_state.selected_nav) if st.session_state.selected_nav in nav_options else 0,
+        label_visibility="collapsed",
+        key="sidebar_nav"
     )
+    st.session_state.selected_nav = selected_page
     
     st.markdown("---")
     
-    # Filter Section
+    # Dynamic TMDB & Local Filters
     st.html('<div class="filter-section-title">Filters (Optional)</div>')
     
-    genre_choices = [
-        "All Genres", "Action", "Adventure", "Animation", "Biography",
-        "Comedy", "Crime", "Drama", "Fantasy", "Mystery", "Romance", "Sci-Fi", "Thriller"
-    ]
+    genre_choices = ["All Genres"] + list(GENRE_MAP.keys())
     selected_genre = st.selectbox("Genre", options=genre_choices, index=0)
     
     year_choices = ["All Years", "2020s", "2010s", "2000s", "1990s", "1980s & Earlier"]
@@ -762,10 +837,19 @@ with st.sidebar:
     selected_rating = st.selectbox("Minimum Rating", options=rating_choices, index=0)
     
     st.html('<div class="filter-btn-container">')
-    filter_submitted = st.button("🎯 Apply Filters", use_container_width=True)
+    filter_applied = st.button("🎯 Apply Filters", use_container_width=True)
     st.html('</div>')
+    
+    # Store filter state
+    if filter_applied:
+        st.session_state.active_filter = {
+            "genre": selected_genre,
+            "year": selected_year,
+            "rating": selected_rating
+        }
+        st.toast("Filters applied across TMDB catalog!", icon="🎬")
 
-# Helper to render a single card
+# Helper to render a movie card
 def render_movie_card_html(title, genre, rating, img_src):
     return (
         f'<div class="movie-card">'
@@ -784,10 +868,9 @@ def render_movie_card_html(title, genre, rating, img_src):
     )
 
 # ==============================================================================
-# PAGE 1: HOME (EXACT MATCH TO DESIGN SCREENSHOT)
+# PAGE 1: HOME (EXACT MATCH TO DESIGN SCREENSHOT + LIVE TMDB FILTERS)
 # ==============================================================================
 if "Home" in selected_page:
-    # 1. Hero Section
     st.html(f"""
     <div class="hero-card">
         <div class="hero-left">
@@ -797,7 +880,7 @@ if "Home" in selected_page:
                 <span class="hero-gradient-text">Favorite Movie</span>
             </div>
             <div class="hero-desc">
-                Get personalized movie recommendations using machine learning based on your preferences, viewing history, and similar users.
+                Get personalized movie recommendations using machine learning and the global TMDB library based on your preferences, viewing history, and similar users.
             </div>
             <div class="hero-btn-row">
                 <a href="#trending" class="hero-btn-primary">
@@ -827,25 +910,30 @@ if "Home" in selected_page:
     </div>
     """)
     
-    # Filter trending cards if filter was selected
-    trending_display = []
-    min_r = 0.0
-    if selected_rating != "Any":
-        min_r = float(selected_rating.split("+")[0])
-        
-    for m in TRENDING_MOVIES:
-        if float(m["rating"]) >= min_r:
-            if selected_genre == "All Genres" or selected_genre.lower() in m["genre"].lower():
-                trending_display.append(m)
-                
-    if not trending_display:
-        trending_display = TRENDING_MOVIES
+    # Check if user applied custom filters
+    has_filter = (
+        selected_genre != "All Genres" or 
+        selected_year != "All Years" or 
+        selected_rating != "Any"
+    )
+    
+    if has_filter:
+        # Fetch live filtered movies from TMDB
+        filtered_movies = discover_movies_tmdb(selected_genre, selected_year, selected_rating, max_results=12)
+        if filtered_movies:
+            trending_display = filtered_movies[:6]
+            recommended_display = filtered_movies[6:12] if len(filtered_movies) > 6 else filtered_movies[:6]
+        else:
+            trending_display = TRENDING_MOVIES_DEFAULT
+            recommended_display = RECOMMENDED_MOVIES_DEFAULT
+    else:
+        trending_display = TRENDING_MOVIES_DEFAULT
+        recommended_display = RECOMMENDED_MOVIES_DEFAULT
         
     trending_cards_html = "".join([
         render_movie_card_html(m["title"], m["genre"], m["rating"], get_poster_src(m))
         for m in trending_display
     ])
-    
     st.html(f'<div class="movie-grid">{trending_cards_html}</div>')
     
     # 3. Recommended For You Section
@@ -861,174 +949,280 @@ if "Home" in selected_page:
     </div>
     """)
     
-    recommended_display = []
-    for m in RECOMMENDED_MOVIES:
-        if float(m["rating"]) >= min_r:
-            if selected_genre == "All Genres" or selected_genre.lower() in m["genre"].lower():
-                recommended_display.append(m)
-                
-    if not recommended_display:
-        recommended_display = RECOMMENDED_MOVIES
-        
     recommended_cards_html = "".join([
         render_movie_card_html(m["title"], m["genre"], m["rating"], get_poster_src(m))
         for m in recommended_display
     ])
-    
     st.html(f'<div class="movie-grid">{recommended_cards_html}</div>')
 
 # ==============================================================================
-# PAGE 2: GET RECOMMENDATIONS
+# PAGE 2: GET RECOMMENDATIONS (GLOBAL TMDB + COLLABORATIVE FILTERING)
 # ==============================================================================
 elif "Get Recommendations" in selected_page:
     st.html("""
     <div class="section-header" style="margin-top: 0px;">
         <div class="section-title-wrap">
             <div class="section-title"><span>⭐</span> AI Movie Recommendation Engine</div>
-            <div class="section-subtitle">Powered by Collaborative Filtering & Cosine Similarity</div>
+            <div class="section-subtitle">Recommend from over 800,000 films globally via TMDB & Machine Learning models</div>
         </div>
     </div>
     """)
     
-    rec_type = st.radio(
-        "Recommendation Type",
-        ["Item-Based Collaborative Filtering (Based on a Movie you like)", "User-Based Collaborative Filtering (Profile ID)"],
+    engine_choice = st.radio(
+        "Choose Recommendation Engine:",
+        ["🌍 Global TMDB Engine (All 800,000+ Movies)", "🔬 Machine Learning Lab (MovieLens 100K Dataset)"],
         horizontal=True
     )
     
-    if "Item-Based" in rec_type:
-        all_titles = movie_info['title'].tolist()
-        default_idx = 0
-        for i, t in enumerate(all_titles):
-            if "Toy Story (1995)" in t:
-                default_idx = i
-                break
-                
-        selected_title = st.selectbox("🎬 Select a Movie You Enjoyed:", all_titles, index=default_idx)
-        top_k = st.slider("Number of Recommendations", min_value=6, max_value=18, value=6, step=6)
+    if "Global TMDB" in engine_choice:
+        rec_tab1, rec_tab2 = st.tabs(["🎯 Single Movie Inspiration", "🎬 Multi-Movie Taste Profile"])
         
-        if st.button("Generate AI Recommendations 🚀", type="primary"):
-            row = movie_info[movie_info['title'] == selected_title]
-            if not row.empty:
-                mid = row.iloc[0]['movie_id']
-                if mid in item_similarity.index:
-                    sim_scores = item_similarity.loc[mid].sort_values(ascending=False).drop(mid, errors='ignore')
-                    top_ids = sim_scores.head(top_k).index.tolist()
+        with rec_tab1:
+            col_search, col_depth = st.columns([3, 1])
+            with col_search:
+                movie_search_input = st.text_input(
+                    "🎬 Search any movie in TMDB's 800,000+ catalog:",
+                    value="Inception",
+                    placeholder="e.g. Dune: Part Two, Oppenheimer, Interstellar, The Dark Knight, Spirited Away..."
+                )
+            with col_depth:
+                top_k_tmdb = st.select_slider("Catalogue Depth:", options=[12, 18, 24, 30, 36, 48], value=24)
+                
+            if movie_search_input:
+                search_candidates = search_movies_tmdb(movie_search_input, max_results=8)
+                if search_candidates:
+                    selected_candidate_title = st.selectbox(
+                        "Select matching film:",
+                        [f"{c['title']} ({c['release_date'][:4] if c['release_date'] else 'N/A'}) - ⭐ {c['rating']}" for c in search_candidates]
+                    )
+                    selected_idx = [f"{c['title']} ({c['release_date'][:4] if c['release_date'] else 'N/A'}) - ⭐ {c['rating']}" for c in search_candidates].index(selected_candidate_title)
+                    target_movie = search_candidates[selected_idx]
                     
-                    st.markdown(f"### Movies Similar to **{selected_title}**")
-                    rec_movies = movie_info[movie_info['movie_id'].isin(top_ids)].copy()
+                    # Benchmark movie banner preview
+                    with st.expander("📌 Selected Film Details & Synopsis", expanded=False):
+                        c_col1, c_col2 = st.columns([1, 4])
+                        with c_col1:
+                            st.image(target_movie["poster_url"], width=130)
+                        with c_col2:
+                            st.markdown(f"### **{target_movie['title']}** ({target_movie['release_date'][:4]})")
+                            st.markdown(f"**Genres:** {target_movie['genre']} | **Rating:** ⭐ {target_movie['rating']}/10")
+                            st.markdown(f"*{target_movie['overview']}*")
+                            trailer_key = get_movie_trailer_key(target_movie["id"])
+                            if trailer_key:
+                                st.markdown(f"[▶ Watch Official Trailer on YouTube](https://www.youtube.com/watch?v={trailer_key})")
                     
-                    cards_html = []
-                    for idx, (_, rec_row) in enumerate(rec_movies.iterrows()):
-                        clean_t = rec_row['clean_title']
-                        rating = rec_row['avg_rating']
-                        genre_tag = f"Released: {int(rec_row['year'])}" if pd.notnull(rec_row['year']) else "Cinema Classic"
+                    col_b1, col_b2 = st.columns([2, 1])
+                    with col_b1:
+                        sim_algo = st.radio(
+                            "Similarity Algorithm:",
+                            ["Viewer Taste & Affinity (TMDB Recommendations)", "Storyline, Plot & Keyword Match (TMDB Similar)"],
+                            horizontal=True
+                        )
+                    with col_b2:
+                        min_rating_filter = st.selectbox("Min Rating:", ["Any", "6.5+ ⭐", "7.0+ ⭐", "7.5+ ⭐", "8.0+ ⭐"], index=0)
                         
-                        meta = fetch_movie_poster_tmdb(rec_row['title'])
-                        poster_url = meta['poster'] if meta else "https://via.placeholder.com/300x450/111625/e52d53?text=" + urllib.parse.quote(clean_t)
-                        if meta and meta.get('rating'):
-                            rating = meta['rating']
-                            
-                        cards_html.append(render_movie_card_html(clean_t, genre_tag, str(rating), poster_url))
-                        
-                    st.html(f'<div class="movie-grid">{"".join(cards_html)}</div>')
+                    min_r_val = 0.0 if min_rating_filter == "Any" else float(min_rating_filter.split("+")[0])
+                    mode_key = "recommendations" if "Viewer Taste" in sim_algo else "similar"
+                    
+                    if st.button("Generate Deep AI Recommendations 🚀", type="primary", use_container_width=True):
+                        with st.spinner(f"Scanning TMDB deep catalog for '{target_movie['title']}'..."):
+                            recs = get_tmdb_deep_similar(target_movie["id"], mode=mode_key, max_items=top_k_tmdb, min_rating=min_r_val)
+                            if recs:
+                                st.markdown(f"### Found **{len(recs)}** recommended films for fans of **{target_movie['title']}**:")
+                                cards_html = "".join([
+                                    render_movie_card_html(m["title"], m["genre"], m["rating"], m["poster_url"])
+                                    for m in recs
+                                ])
+                                st.html(f'<div class="movie-grid">{cards_html}</div>')
+                            else:
+                                st.info("No matching films found with the chosen rating threshold. Try lowering the minimum rating.")
                 else:
-                    st.warning("This movie does not have enough ratings in the training matrix to compute cosine similarity.")
-    else:
-        user_id = st.number_input("Enter User ID (1 to 943):", min_value=1, max_value=943, value=1)
-        top_k = st.slider("Number of Recommendations", min_value=6, max_value=18, value=6, step=6)
-        
-        if st.button("Predict Top Recommendations 🚀", type="primary"):
-            if user_id in train_matrix.index:
-                user_ratings = train_matrix.loc[user_id]
-                unrated = user_ratings[user_ratings == 0].index
-                rated = user_ratings[user_ratings > 0]
-                
-                preds = {}
-                for mid in unrated[:150]:
-                    if mid in item_similarity.index:
-                        sims = item_similarity.loc[mid, rated.index]
-                        if sims.sum() > 0:
-                            pred = (sims * rated).sum() / sims.sum()
-                            preds[mid] = pred
-                            
-                top_pred_ids = sorted(preds, key=preds.get, reverse=True)[:top_k]
-                rec_movies = movie_info[movie_info['movie_id'].isin(top_pred_ids)]
-                
-                st.markdown(f"### Top Personalized Picks for **User #{user_id}**")
-                cards_html = []
-                for _, rec_row in rec_movies.iterrows():
-                    clean_t = rec_row['clean_title']
-                    rating = rec_row['avg_rating']
-                    genre_tag = f"Predicted ⭐ {round(preds.get(rec_row['movie_id'], rating), 1)}"
-                    meta = fetch_movie_poster_tmdb(rec_row['title'])
-                    poster_url = meta['poster'] if meta else "https://via.placeholder.com/300x450/111625/e52d53?text=" + urllib.parse.quote(clean_t)
-                    cards_html.append(render_movie_card_html(clean_t, genre_tag, str(rating), poster_url))
+                    st.warning(f"No movie found matching '{movie_search_input}'. Please try another search title.")
                     
-                st.html(f'<div class="movie-grid">{"".join(cards_html)}</div>')
+        with rec_tab2:
+            st.markdown("#### Combine Multiple Films for an Aggregated Taste Profile")
+            st.caption("Add 2 or 3 movies you love to find films that blend their themes and audience patterns.")
+            
+            multi_col1, multi_col2 = st.columns(2)
+            with multi_col1:
+                movie1_name = st.text_input("First Favorite Film:", value="Interstellar")
+            with multi_col2:
+                movie2_name = st.text_input("Second Favorite Film:", value="Blade Runner 2049")
+                
+            multi_top_k = st.select_slider("Results to discover:", options=[12, 18, 24, 36], value=24, key="multi_slider")
+            
+            if st.button("Generate Blended Recommendations 🪄", type="primary", use_container_width=True):
+                cand1 = search_movies_tmdb(movie1_name, max_results=1)
+                cand2 = search_movies_tmdb(movie2_name, max_results=1)
+                
+                target_ids = []
+                names = []
+                if cand1:
+                    target_ids.append(cand1[0]["id"])
+                    names.append(cand1[0]["title"])
+                if cand2:
+                    target_ids.append(cand2[0]["id"])
+                    names.append(cand2[0]["title"])
+                    
+                if target_ids:
+                    with st.spinner(f"Cross-referencing TMDB recommendation graphs for {' and '.join(names)}..."):
+                        blended_recs = get_multi_movie_recommendations(target_ids, top_n=multi_top_k)
+                        if blended_recs:
+                            st.markdown(f"### Blended Recommendations for fans of **{' & '.join(names)}**:")
+                            cards_html = "".join([
+                                render_movie_card_html(m["title"], m["genre"], m["rating"], m["poster_url"])
+                                for m in blended_recs
+                            ])
+                            st.html(f'<div class="movie-grid">{cards_html}</div>')
+                        else:
+                            st.info("No shared recommendations found.")
+                else:
+                    st.warning("Please enter valid movie titles.")
+
+    else:
+        # MovieLens 100K Machine Learning Engine
+        st.markdown("#### 🔬 Item-Item Collaborative Filtering (Trained on 100K User Ratings)")
+        if not movie_info.empty and item_similarity is not None:
+            all_titles = movie_info['title'].tolist()
+            default_idx = 0
+            for i, t in enumerate(all_titles):
+                if "Toy Story (1995)" in t:
+                    default_idx = i
+                    break
+                    
+            selected_local_title = st.selectbox("Select a classic benchmark movie:", all_titles, index=default_idx)
+            top_k_ml = st.slider("Number of Recommendations:", min_value=6, max_value=24, value=12, step=6)
+            
+            if st.button("Run Collaborative Filtering 🚀", type="primary", use_container_width=True):
+                row = movie_info[movie_info['title'] == selected_local_title]
+                if not row.empty:
+                    mid = row.iloc[0]['movie_id']
+                    if mid in item_similarity.index:
+                        sim_scores = item_similarity.loc[mid].sort_values(ascending=False).drop(mid, errors='ignore')
+                        top_ids = sim_scores.head(top_k_ml).index.tolist()
+                        
+                        st.markdown(f"### ML Model Output for **{selected_local_title}**:")
+                        rec_movies = movie_info[movie_info['movie_id'].isin(top_ids)].copy()
+                        
+                        cards_html = []
+                        for _, rec_row in rec_movies.iterrows():
+                            clean_t = rec_row['clean_title']
+                            rating = rec_row['avg_rating']
+                            genre_tag = f"Released: {int(rec_row['year'])}" if pd.notnull(rec_row['year']) else "Film"
+                            
+                            live_meta = search_movies_tmdb(clean_t, max_results=1)
+                            poster_url = live_meta[0]["poster_url"] if live_meta else "https://via.placeholder.com/300x450/111625/e52d53?text=" + urllib.parse.quote(clean_t)
+                            if live_meta:
+                                rating = live_meta[0]["rating"]
+                                genre_tag = live_meta[0]["genre"]
+                                
+                            cards_html.append(render_movie_card_html(clean_t, genre_tag, str(rating), poster_url))
+                            
+                        st.html(f'<div class="movie-grid">{cards_html}</div>')
+        else:
+            st.warning("Local MovieLens model files not loaded.")
 
 # ==============================================================================
-# PAGE 3: SEARCH MOVIES
+# PAGE 3: SEARCH MOVIES (ALL 800,000+ TMDB MOVIES)
 # ==============================================================================
 elif "Search Movies" in selected_page:
     st.html("""
     <div class="section-header" style="margin-top: 0px;">
         <div class="section-title-wrap">
-            <div class="section-title"><span>🔍</span> Explore Movie Library</div>
-            <div class="section-subtitle">Search over 1,680 films in the dataset with instant posters & ratings</div>
+            <div class="section-title"><span>🔍</span> Explore Global Movie Library</div>
+            <div class="section-subtitle">Live search across 800,000+ films with instant high-res artwork & ratings</div>
         </div>
     </div>
     """)
     
-    search_query = st.text_input("Type movie title or keyword...", value="Star Wars")
-    
+    col_s1, col_s2 = st.columns([4, 1])
+    with col_s1:
+        search_query = st.text_input("Enter movie title, franchise, or character:", value="Spider-Man")
+    with col_s2:
+        search_limit = st.selectbox("Results count:", [12, 18, 24, 36], index=1)
+        
     if search_query:
-        matches = movie_info[movie_info['clean_title'].str.contains(search_query, case=False, na=False)].head(12)
-        if not matches.empty:
-            cards_html = []
-            for _, m in matches.iterrows():
-                clean_t = m['clean_title']
-                rating = m['avg_rating']
-                genre_tag = f"Release: {int(m['year'])}" if pd.notnull(m['year']) else "Film"
-                meta = fetch_movie_poster_tmdb(m['title'])
-                poster_url = meta['poster'] if meta else "https://via.placeholder.com/300x450/111625/e52d53?text=" + urllib.parse.quote(clean_t)
-                cards_html.append(render_movie_card_html(clean_t, genre_tag, str(rating), poster_url))
-                
-            st.html(f'<div class="movie-grid">{"".join(cards_html)}</div>')
-        else:
-            st.info("No matching movies found. Try searching for 'Matrix', 'Toy Story', 'Godfather', or 'Batman'.")
+        with st.spinner("Searching TMDB catalog..."):
+            found_movies = search_movies_tmdb(search_query, max_results=search_limit)
+            if found_movies:
+                st.markdown(f"Found **{len(found_movies)}** titles matching *'{search_query}'*:")
+                cards_html = "".join([
+                    render_movie_card_html(m["title"], f"{m['release_date'][:4] if m['release_date'] else ''} • {m['genre']}", m["rating"], m["poster_url"])
+                    for m in found_movies
+                ])
+                st.html(f'<div class="movie-grid">{cards_html}</div>')
+            else:
+                st.info(f"No results found for '{search_query}'. Try another search.")
 
 # ==============================================================================
-# PAGE 4: SIMILAR MOVIES
+# PAGE 4: SIMILAR MOVIES (FULL TMDB CATALOGUE SEARCH & DEEP RETRIEVAL)
 # ==============================================================================
 elif "Similar Movies" in selected_page:
     st.html("""
     <div class="section-header" style="margin-top: 0px;">
         <div class="section-title-wrap">
-            <div class="section-title"><span>👥</span> Item-to-Item Similarity Explorer</div>
-            <div class="section-subtitle">Explore movies that share similar viewer taste profiles</div>
+            <div class="section-title"><span>👥</span> Deep Film Similarity Explorer</div>
+            <div class="section-subtitle">Explore hundreds of matching movies across TMDB's full 800,000+ global library</div>
         </div>
     </div>
     """)
     
-    sample_popular = movie_info.sort_values(by='rating_count', ascending=False)['title'].head(100).tolist()
-    picked_movie = st.selectbox("Select a benchmark movie:", sample_popular)
-    
-    row = movie_info[movie_info['title'] == picked_movie]
-    if not row.empty:
-        mid = row.iloc[0]['movie_id']
-        if mid in item_similarity.index:
-            sims = item_similarity.loc[mid].sort_values(ascending=False).drop(mid, errors='ignore').head(12)
-            sim_df = movie_info[movie_info['movie_id'].isin(sims.index)].copy()
+    col_sim_search, col_sim_limit = st.columns([3, 1])
+    with col_sim_search:
+        target_search = st.text_input(
+            "Search any benchmark movie in the world:",
+            value="The Dark Knight",
+            placeholder="e.g. Dune, Interstellar, Parasite, Avengers, Pulp Fiction, Spirited Away..."
+        )
+    with col_sim_limit:
+        similarity_depth = st.select_slider("Explore Catalog Depth:", options=[12, 18, 24, 30, 36, 48], value=24)
+        
+    if target_search:
+        sim_candidates = search_movies_tmdb(target_search, max_results=6)
+        if sim_candidates:
+            chosen_candidate_str = st.selectbox(
+                "Select exact movie:",
+                [f"{c['title']} ({c['release_date'][:4] if c['release_date'] else 'N/A'}) - ⭐ {c['rating']}" for c in sim_candidates]
+            )
+            c_idx = [f"{c['title']} ({c['release_date'][:4] if c['release_date'] else 'N/A'}) - ⭐ {c['rating']}" for c in sim_candidates].index(chosen_candidate_str)
+            active_benchmark = sim_candidates[c_idx]
             
-            cards_html = []
-            for _, m in sim_df.iterrows():
-                score = round(sims.get(m['movie_id'], 0.0) * 100, 1)
-                meta = fetch_movie_poster_tmdb(m['title'])
-                poster_url = meta['poster'] if meta else "https://via.placeholder.com/300x450/111625/e52d53?text=" + urllib.parse.quote(m['clean_title'])
-                cards_html.append(render_movie_card_html(m['clean_title'], f"Similarity: {score}%", str(m['avg_rating']), poster_url))
+            # Interactive Filter Bar for Similarity Catalog
+            col_filter_mode, col_filter_genre, col_filter_rate = st.columns([2, 1, 1])
+            with col_filter_mode:
+                sim_mode = st.radio(
+                    "Similarity Metric:",
+                    ["Storyline & Keyword Similarity (TMDB Similar)", "Co-Viewer Taste & Affinity (TMDB Recommendations)"],
+                    horizontal=True
+                )
+            with col_filter_genre:
+                genre_filter = st.selectbox("Genre Filter:", ["All Genres"] + list(GENRE_MAP.keys()), index=0)
+            with col_filter_rate:
+                rate_filter = st.selectbox("Rating Filter:", ["Any", "6.5+ ⭐", "7.0+ ⭐", "7.5+ ⭐", "8.0+ ⭐"], index=0)
                 
-            st.html(f'<div class="movie-grid">{"".join(cards_html)}</div>')
+            min_r_val = 0.0 if rate_filter == "Any" else float(rate_filter.split("+")[0])
+            mode_api_param = "similar" if "Storyline" in sim_mode else "recommendations"
+            
+            if st.button("Explore Full Similarity Catalogue 🚀", type="primary", use_container_width=True):
+                with st.spinner(f"Extracting deep similarity network for '{active_benchmark['title']}' from TMDB..."):
+                    deep_results = get_tmdb_deep_similar(
+                        active_benchmark["id"],
+                        mode=mode_api_param,
+                        max_items=similarity_depth,
+                        min_rating=min_r_val,
+                        filter_genre=genre_filter
+                    )
+                    if deep_results:
+                        st.markdown(f"### Found **{len(deep_results)}** similar films for **{active_benchmark['title']}**:")
+                        cards_html = "".join([
+                            render_movie_card_html(m["title"], m["genre"], m["rating"], m["poster_url"])
+                            for m in deep_results
+                        ])
+                        st.html(f'<div class="movie-grid">{cards_html}</div>')
+                    else:
+                        st.info("No matching films found with the active filter. Try resetting filters.")
+        else:
+            st.warning(f"No movie found matching '{target_search}'.")
 
 # ==============================================================================
 # PAGE 5: MOVIE INSIGHTS
@@ -1038,7 +1232,7 @@ elif "Movie Insights" in selected_page:
     <div class="section-header" style="margin-top: 0px;">
         <div class="section-title-wrap">
             <div class="section-title"><span>📊</span> Dataset Metrics & Analytics</div>
-            <div class="section-subtitle">Real-time statistics from the collaborative filtering models</div>
+            <div class="section-subtitle">System intelligence from TMDB & Collaborative Filtering matrix</div>
         </div>
     </div>
     """)
@@ -1047,29 +1241,29 @@ elif "Movie Insights" in selected_page:
     with col1:
         st.html("""
         <div class="metric-box">
-            <div class="metric-number">1,682</div>
-            <div class="metric-label">Total Movies</div>
+            <div class="metric-number">800,000+</div>
+            <div class="metric-label">TMDB Live Films</div>
         </div>
         """)
     with col2:
         st.html("""
         <div class="metric-box">
-            <div class="metric-number">943</div>
-            <div class="metric-label">Active Users</div>
+            <div class="metric-number">100,000</div>
+            <div class="metric-label">ML Ratings Trained</div>
         </div>
         """)
     with col3:
         st.html(f"""
         <div class="metric-box">
             <div class="metric-number">{round(global_mean, 2)} ⭐</div>
-            <div class="metric-label">Global Mean Rating</div>
+            <div class="metric-label">ML Global Baseline</div>
         </div>
         """)
     with col4:
         st.html("""
         <div class="metric-box">
-            <div class="metric-number">100,000+</div>
-            <div class="metric-label">Training Ratings</div>
+            <div class="metric-number">1,682</div>
+            <div class="metric-label">MovieLens Items</div>
         </div>
         """)
         
@@ -1077,16 +1271,18 @@ elif "Movie Insights" in selected_page:
     
     col_left, col_right = st.columns(2)
     with col_left:
-        st.markdown("#### 🔥 Most Reviewed Movies")
-        top_rated = movie_info.sort_values(by='rating_count', ascending=False)[['clean_title', 'rating_count', 'avg_rating']].head(10)
-        top_rated.columns = ['Title', 'Total Reviews', 'Avg Rating ⭐']
-        st.dataframe(top_rated, use_container_width=True)
-        
+        st.markdown("#### 🔥 Most Reviewed Classic Films")
+        if not movie_info.empty:
+            top_rated = movie_info.sort_values(by='rating_count', ascending=False)[['clean_title', 'rating_count', 'avg_rating']].head(10)
+            top_rated.columns = ['Title', 'Total Reviews', 'Avg Rating ⭐']
+            st.dataframe(top_rated, use_container_width=True)
+            
     with col_right:
         st.markdown("#### 🏆 Highest Rated Classics (Min. 50 Reviews)")
-        critics = movie_info[movie_info['rating_count'] >= 50].sort_values(by='avg_rating', ascending=False)[['clean_title', 'avg_rating', 'rating_count']].head(10)
-        critics.columns = ['Title', 'Avg Rating ⭐', 'Total Reviews']
-        st.dataframe(critics, use_container_width=True)
+        if not movie_info.empty:
+            critics = movie_info[movie_info['rating_count'] >= 50].sort_values(by='avg_rating', ascending=False)[['clean_title', 'avg_rating', 'rating_count']].head(10)
+            critics.columns = ['Title', 'Avg Rating ⭐', 'Total Reviews']
+            st.dataframe(critics, use_container_width=True)
 
 # ==============================================================================
 # PAGE 6: ABOUT
@@ -1101,13 +1297,13 @@ elif "About" in selected_page:
     </div>
     
     <div style="background: #111625; padding: 26px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.08); line-height: 1.8;">
-        <h3 style="color: #ff4071; margin-top: 0;">Collaborative Filtering Architecture</h3>
-        <p>MovieRec is an AI-powered movie recommendation system designed to provide highly accurate and personalized film suggestions using machine learning techniques:</p>
+        <h3 style="color: #ff4071; margin-top: 0;">Dual Recommendation Architecture</h3>
+        <p>MovieRec combines the best of both modern web-scale APIs and custom machine learning algorithms:</p>
         <ul>
-            <li><strong>Item-Item Collaborative Filtering:</strong> Analyzes patterns of user preferences to compute pairwise cosine similarities between films in a high-dimensional rating space.</li>
-            <li><strong>Sparsity Handling:</strong> Utilizes pre-computed similarity matrices and global baseline estimates to mitigate cold-start and sparse user vectors.</li>
-            <li><strong>Dynamic Poster Resolution:</strong> Real-time metadata and high-definition movie art integration via TMDB API with local cached assets.</li>
-            <li><strong>Dataset:</strong> Built on the MovieLens 100K benchmark dataset comprising 100,000 ratings from 943 users across 1,682 movies.</li>
+            <li><strong>TMDB Global Catalog Integration:</strong> Connects to The Movie Database REST API to access over 800,000 films with real-time recommendations, high-resolution CDN posters, user ratings, and genre filtering.</li>
+            <li><strong>Item-Item Collaborative Filtering (Machine Learning):</strong> Employs precomputed cosine similarity matrices trained on the MovieLens 100K benchmark dataset (943 users × 1,653 items) to find mathematical neighbors in user preference space.</li>
+            <li><strong>Zero-Latency Local Caching:</strong> All showcase artwork, posters, and base64 assets load instantly without network bottlenecks.</li>
+            <li><strong>Responsive UI:</strong> Built with Streamlit, custom CSS Grid, and vibrant cinematic gradients matching modern dark streaming platforms.</li>
         </ul>
     </div>
     """)
